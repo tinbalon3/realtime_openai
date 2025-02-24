@@ -15,8 +15,8 @@ import websockets
 from pynput import keyboard
 
 from input_handler import InputHandler
-from request_tracker import RequestTracker
-from worker import Worker
+from v2.request_tracker import RequestTracker
+from v1.worker import Worker
 
 load_dotenv()
 import logging
@@ -44,11 +44,12 @@ class RealtimeClient:
         api_key: str,
         model: str = "gpt-4o-realtime-preview-2024-10-01",
         voice: str = "alloy",
-        instructions = """
-        You are a translation tool. Your sole task is to read text in English and provide an accurate, concise Vietnamese translation. 
-        Do not offer explanations, clarifications, or any additional responses besides the translated text.
-        If you are not able to understand the text to translate, don’t return anything.
-                        """,
+       
+        instructions: str = """You are a real-time translation tool. 
+        Your only task is to translate text from Vietnamese to English accurately and concisely. 
+        If the input is clear Vietnamese text, provide the English translation and keep any English words unchanged. 
+        If the input contains noise, is unclear, or cannot be understood, return an empty string (''). 
+        Do not provide explanations, extra comments, or anything beyond the translation or an empty string.""",
         temperature: float = 0.8,
         turn_detection_mode: TurnDetectionMode = TurnDetectionMode.MANUAL,
         on_text_delta: Optional[Callable[[str], None]] = None,
@@ -128,7 +129,7 @@ class RealtimeClient:
                 "turn_detection": {
                     "type": "server_vad",
                     "threshold": 0.5,
-                    "prefix_padding_ms": 500,
+                    "prefix_padding_ms": 200,
                     "silence_duration_ms": 300
                 },
                 "tools": tools,
@@ -189,18 +190,16 @@ class RealtimeClient:
                         
                 elif event_type == "response.audio_transcript.done":
                     transcript = event.get("transcript", "")
-                    response_id = event.get("item_id","")
-                    request_id =  request_tracker.get_request_id(response_id)
+                    response_id = event.get("item_id", "")
+                    request_id = request_tracker.get_request_id(response_id)
                     # print(f"Received response_id {response_id} for request_id {request_id}")
                     self._is_responding = False
-                    
                     worker = next((w for w in workers if w.worker == self), None)
                     if worker:
                         worker.is_responsing = False
-                        worker.available_Status = True  
-                        
+                        worker.available_Status = True
                     if request_id is not None:
-                        await request_tracker.add_response(request_id, transcript) 
+                        await request_tracker.add_response(request_id, transcript)  # Chỉ xử lý nếu transcript có nội dung
 
         except websockets.exceptions.ConnectionClosed:
             print(f"Connection closed ")
@@ -219,10 +218,10 @@ class AudioHandler:
     """Handles audio input/output for streaming and playback."""
     def __init__(self):
         # Audio parameters
-        self.format = pyaudio.paInt16
+        self.format = pyaudio.paFloat32
         self.channels = 1
         self.rate = 24000
-        self.chunk = 1024
+        self.chunk = 24000
 
         self.audio = pyaudio.PyAudio()
 
@@ -268,7 +267,7 @@ class AudioHandler:
                     new_worker = await get_available_worker(workers,worker)
 
                     if new_worker:
-                        print(f"Chuyển từ {worker.name} sang {new_worker.name}")
+                        # print(f"Chuyển từ {worker.name} sang {new_worker.name}")
                         worker.available_Used = False
                         worker = new_worker
                         worker.available_Used = True
@@ -306,6 +305,7 @@ class AudioHandler:
             self.playback_event.clear()
             self.playback_thread = threading.Thread(target=self._continuous_playback)
             self.playback_thread.start()
+            
     def _continuous_playback(self):
         """Continuously play audio from the buffer"""
         self.playback_stream = self.audio.open(

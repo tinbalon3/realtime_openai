@@ -1,4 +1,4 @@
-from realtime_client import RealtimeClient
+from v1.realtime_client import RealtimeClient
 class Worker:
     def __init__(self, worker: RealtimeClient, name: str):
         self.name = name
