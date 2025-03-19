@@ -4,7 +4,7 @@ import asyncio
 class RequestTracker:
     def __init__(self):
         self.request_counter = 0
-        self.response_queue = asyncio.PriorityQueue()  # Hàng đợi ưu tiên để giữ thứ tự
+        self.response_queue = asyncio.Queue()  # Hàng đợi ưu tiên để giữ thứ tự
         self.request_map = {}  # Lưu mapping từ request_id -> response_id
 
     def new_request(self):

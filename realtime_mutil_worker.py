@@ -1,10 +1,13 @@
 import asyncio
-import os
-import pyaudio
-import wave
-import json
 import base64
-import io
+import json
+import os
+import sys
+import pyaudio
+
+from request_tracker import RequestTracker
+
+
 import queue
 import threading
 from typing import Optional, Callable, List, Dict, Any
@@ -14,9 +17,11 @@ from pydub import AudioSegment
 import websockets
 from pynput import keyboard
 
+
 from input_handler import InputHandler
-from v2.request_tracker import RequestTracker
-from v1.worker import Worker
+from v1.realtime_client import RealtimeClient, TurnDetectionMode
+from worker_v2 import Worker, get_available_worker
+
 
 load_dotenv()
 import logging
@@ -24,18 +29,11 @@ import logging
 # Configure logging
 logging.basicConfig(filename='worker_status.log',encoding="utf-8", level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 api_key = os.getenv("OPENAI_API_KEY")
-response_queue = asyncio.Queue()
 
-change_worker = False
-request_tracker = RequestTracker()
-workers = []
-audio_handler = None
-previous_worker = None
-handle_messages_task = None
-start_streaming_task = None
 class TurnDetectionMode(Enum):
     SERVER_VAD = "server_vad"
     MANUAL = "manual"
+
 class RealtimeClient:
     """Handles WebSocket communication with OpenAI Realtime API."""
     
@@ -45,11 +43,16 @@ class RealtimeClient:
         model: str = "gpt-4o-realtime-preview-2024-10-01",
         voice: str = "alloy",
        
-        instructions: str = """You are a real-time translation tool. 
-        Your only task is to translate text from Vietnamese to English accurately and concisely. 
-        If the input is clear Vietnamese text, provide the English translation and keep any English words unchanged. 
-        If the input contains noise, is unclear, or cannot be understood, return an empty string (''). 
-        Do not provide explanations, extra comments, or anything beyond the translation or an empty string.""",
+        instructions: str = """
+              You are TranSlate, a real-time translation tool for English and Vietnamese.
+- Your only task is to translate text accurately and concisely. 
+- If the input is in English, translate it to Vietnamese. 
+- If the input is in Vietnamese, translate it to English. 
+- Provide only the translation; do not return any additional text or answer questions.
+- If you don't understand the input, or if the input is unclear, return an empty string.
+- If the input is unclear, contains noise, or lacks meaning, return an empty string.
+- Output the translation in plain text format.
+        """,
         temperature: float = 0.8,
         turn_detection_mode: TurnDetectionMode = TurnDetectionMode.MANUAL,
         on_text_delta: Optional[Callable[[str], None]] = None,
@@ -129,8 +132,8 @@ class RealtimeClient:
                 "turn_detection": {
                     "type": "server_vad",
                     "threshold": 0.5,
-                    "prefix_padding_ms": 200,
-                    "silence_duration_ms": 300
+                    "prefix_padding_ms": 300,
+                    "silence_duration_ms": 200
                 },
                 "tools": tools,
                 "tool_choice": "auto",
@@ -150,78 +153,63 @@ class RealtimeClient:
 
     async def send_audio(self, audio_chunk: bytes):
         """Send streaming audio to the API."""
+        # print("Sending audio...")
         audio_b64 = base64.b64encode(audio_chunk).decode()
         await self.ws.send(json.dumps({"type": "input_audio_buffer.append", "audio": audio_b64}))
 
     async def handle_messages(self):
-        """Handle messages from OpenAI WebSocket."""
-        print(f"Handling messages...")
-        global audio_handler,request_tracker
+        """Xử lý tin nhắn từ WebSocket với đồng bộ hóa trạng thái."""
+        print(f"Handling messages for {self}")
+        global audio_handler, request_tracker,workers
         try:
             async for message in self.ws:
                 event = json.loads(message)
                 event_type = event.get("type")
 
                 if event_type == "conversation.item.created":
-                  
                     self._current_item_id = event.get("item", {}).get("id")
                     self._is_responding = True
-                    request_id = request_tracker.new_request()  # Tạo ID ngay khi gửi yêu cầu
-                    await request_tracker.track_request(request_id, self._current_item_id)  # Liên kết ID với response_id
-                    # print(f"Created item {self._current_item_id} for request {request_id} of worker {worker.name}")
+                    request_id = request_tracker.new_request()
+                    await request_tracker.track_request(request_id, self._current_item_id)
                     worker = next((w for w in workers if w.worker == self), None)
                     if worker:
-                        worker.available_Status = False  # Mark as unavailable
-                        worker.is_responsing = True
-                        
+                        await worker.set_status(False, True, worker.available_Used)
 
-                
-                elif event_type == "input_audio_buffer.speech_started":
-                    print("Speech started\n")
-                    
-                elif event_type == "input_audio_buffer.speech_stopped":
-                    print("Speech ended\n")
-                    
                 elif event_type == "response.done":
                     worker = next((w for w in workers if w.worker == self), None)
                     if worker:
-                        worker.is_responsing = False
-                        worker.available_Status = True  
-                        
+                        await worker.set_status(True, False, worker.available_Used)
+
                 elif event_type == "response.audio_transcript.done":
                     transcript = event.get("transcript", "")
                     response_id = event.get("item_id", "")
                     request_id = request_tracker.get_request_id(response_id)
-                    # print(f"Received response_id {response_id} for request_id {request_id}")
                     self._is_responding = False
                     worker = next((w for w in workers if w.worker == self), None)
                     if worker:
-                        worker.is_responsing = False
-                        worker.available_Status = True
+                        await worker.set_status(True, False, worker.available_Used)
                     if request_id is not None:
-                        await request_tracker.add_response(request_id, transcript)  # Chỉ xử lý nếu transcript có nội dung
+                        await request_tracker.add_response(request_id, transcript)
 
         except websockets.exceptions.ConnectionClosed:
-            print(f"Connection closed ")
+            print(f"Connection closed for {self}")
         except Exception as e:
-            print(f"Error in message handling : {str(e)}")
-
-
-    async def close(self):
-        """Close WebSocket connection."""
+            print(f"Error in message handling: {str(e)}")
+    async def close(self) -> None:
+        """Close the WebSocket connection."""
         if self.ws:
             await self.ws.close()
-    
+
 
 
 class AudioHandler:
     """Handles audio input/output for streaming and playback."""
     def __init__(self):
         # Audio parameters
-        self.format = pyaudio.paFloat32
+        self.format = pyaudio.paInt16
         self.channels = 1
         self.rate = 24000
-        self.chunk = 24000
+        self.chunk = 4096
 
         self.audio = pyaudio.PyAudio()
 
@@ -243,7 +231,7 @@ class AudioHandler:
        
     
     async def start_streaming(self, worker: Worker):
-        """Start continuous audio streaming with efficient worker switching."""
+        """Khởi động streaming âm thanh với kiểm tra trạng thái và timeout."""
         if self.streaming:
             return
 
@@ -257,38 +245,37 @@ class AudioHandler:
         )
 
         print(f"\nStreaming audio... Press 'q' to stop.")
-
         global workers
-        
         while self.streaming:
             try:
-                # Kiểm tra nếu worker hiện tại không khả dụng hoặc đang phản hồi
+                # Kiểm tra trạng thái worker và kết nối WebSocket
                 if not worker.available_Status and worker.available_Used:
-                    new_worker = await get_available_worker(workers,worker)
-
+                    new_worker = await get_available_worker(workers, worker)
                     if new_worker:
-                        # print(f"Chuyển từ {worker.name} sang {new_worker.name}")
-                        worker.available_Used = False
+                        print(f"Switched from {worker.name} to {new_worker.name}")
+                        await worker.set_status(True, False, False)  # Giải phóng worker cũ
                         worker = new_worker
-                        worker.available_Used = True
+                        await worker.set_status(True, False, True)
                     else:
-                        print("Không có worker khả dụng")
-                        break
+                        print("No available worker, retrying...")
+                        await asyncio.sleep(0.2)
+                        continue
 
-                # Đọc dữ liệu âm thanh
+                # Đọc và gửi audio với timeout
                 data = self.stream.read(self.chunk, exception_on_overflow=False)
-
-                # Gửi dữ liệu đến worker
-                # print(f"Sending audio to {worker.name} and worker status: {worker.available_Status} and worker used: {worker.available_Used}")
-                
+                # await asyncio.wait_for(worker.worker.send_audio(data), timeout=2.0)
                 await worker.worker.send_audio(data)
 
+            except asyncio.TimeoutError:
+                logging.warning(f"Timeout sending audio to {worker.name}, switching...")
+                new_worker = await get_available_worker(workers, worker)
+                if new_worker:
+                    worker = new_worker
             except Exception as e:
-                print(f"Lỗi khi streaming: {e}")
+                logging.error(f"Streaming error: {e}")
                 break
 
-            await asyncio.sleep(0.01)  # Tránh chiếm toàn bộ CPU
- 
+            await asyncio.sleep(0.05)  # Giảm tải CPU, phù hợp với thời gian thực
         
             
     def play_audio(self, audio_data: bytes):
@@ -344,7 +331,7 @@ class AudioHandler:
             audio_data = audio_segment.raw_data
             
             # Play the audio chunk in smaller portions to allow for quicker interruption
-            chunk_size = 1024  # Adjust this value as needed
+            chunk_size = 24000  # Adjust this value as needed
             for i in range(0, len(audio_data), chunk_size):
                 if self.playback_event.is_set():
                     break
@@ -393,58 +380,60 @@ class AudioHandler:
 
 
 
-async def init_client():
-    """Initialize and manage workers and streaming."""
-    global workers,audio_handler,request_tracker
+# async def monitor_workers(workers: List[Worker]):
+#     """Giám sát trạng thái worker và tái kết nối nếu cần."""
+#     while True:
+#         for worker in workers:
+#             async with worker.lock:
+#                 if worker.worker.ws and worker.worker.ws
+#                     logging.warning(f"Worker {worker.name} disconnected, reconnecting...")
+#                     await worker.worker.connect()
+#                     await worker.set_status(True, False, worker.available_Used)
+#         await asyncio.sleep(5)  # Kiểm tra mỗi 5 giây
+
+async def init_client(num_workers: int = 3):
+    """Khởi tạo worker động và quản lý streaming."""
+    global workers, audio_handler, request_tracker
+    request_tracker = RequestTracker()
     print("Initializing clients...")
     audio_handler = AudioHandler()
     input_handler = InputHandler()
     input_handler.loop = asyncio.get_running_loop()
-    asyncio.create_task(process_responses())
-    client_1 = Worker(RealtimeClient(
-        api_key=api_key,
-        on_audio_delta=lambda audio: audio_handler.play_audio(audio),
-        on_interrupt=lambda: audio_handler.stop_playback_immediately(),
-        turn_detection_mode=TurnDetectionMode.SERVER_VAD
-        
-    ),"worker_1")
 
-    client_2 = Worker(RealtimeClient(
-        api_key=api_key,
-        on_audio_delta=lambda audio: audio_handler.play_audio(audio),
-        on_interrupt=lambda: audio_handler.stop_playback_immediately,
-        turn_detection_mode=TurnDetectionMode.SERVER_VAD  
-    ),"worker_2")
-    client_3 = Worker(RealtimeClient(
-        api_key=api_key,
-        on_audio_delta=lambda audio: audio_handler.play_audio(audio),
-        on_interrupt=lambda: audio_handler.stop_playback_immediately,
-        turn_detection_mode=TurnDetectionMode.SERVER_VAD  
-    ),"worker_3")
-   
-    workers = [client_1,client_2,client_3]
-    
+    # Tạo danh sách worker động
+    workers = [
+        Worker(
+            RealtimeClient(
+                api_key=api_key,
+                on_audio_delta=lambda audio: audio_handler.play_audio(audio),
+                on_interrupt=lambda: audio_handler.stop_playback_immediately(),
+                turn_detection_mode=TurnDetectionMode.SERVER_VAD
+            ),
+            f"worker_{i+1}"
+        ) for i in range(num_workers)
+    ]
 
     worker_used = workers[0]
-    worker_used.available_Used = True
+    await worker_used.set_status(True, False, True)  # Đánh dấu worker đầu tiên là đã dùng
+
+    # Khởi động các tác vụ
     listener = keyboard.Listener(on_press=input_handler.on_press)
     listener.start()
     try:
-        print("Connected to OpenAI Realtime API!")
-        print("Press 'q' to quit\n")
+        print("Connected to OpenAI Realtime API! Press 'q' to quit\n")
         for worker in workers:
             await worker.worker.connect()
             asyncio.create_task(worker.worker.handle_messages())
-       
+
         asyncio.create_task(audio_handler.start_streaming(worker_used))
-        
-        
+        # asyncio.create_task(monitor_workers(workers))  # Thêm giám sát worker
+        asyncio.create_task(process_responses())
+
         while True:
             command, _ = await input_handler.command_queue.get()
-            
             if command == 'q':
                 break
-            
+
     except Exception as e:
         print(f"Error: {e}")
     finally:
@@ -452,28 +441,11 @@ async def init_client():
         audio_handler.cleanup()
         await close_connect()
         
-async def get_available_worker(workers,worker_used):
-    """Find the first available worker or reset usage if all are used."""
-    # First try to find an unused worker
-    available_worker = next(
-        (worker for worker in workers if worker != worker_used and worker.available_Status and not worker.is_responsing and not worker.available_Used),
-        None
-    )
-    
-    if not available_worker:
-        idle_workers = [worker for worker in workers if worker.available_Status and not worker.is_responsing]
-        if idle_workers:
-            # Reset the usage flag for all idle workers
-            for worker in idle_workers:
-                worker.available_Used = False
-            # Get the first now-available worker
-            available_worker = idle_workers[0]
-    if available_worker is None:
-        await log_worker_status(workers)
-    return available_worker
+
 
 async def process_responses():
     """Luôn lấy phản hồi từ request_tracker và xử lý theo thứ tự."""
+    global request_tracker
     while True:
         request_id, response = await request_tracker.get_next_response()
         print(f"Processing response {request_id}: {response}")
@@ -487,6 +459,7 @@ async def log_worker_status(workers):
         logging.info(f"  Is Responding: {worker.is_responsing}")
         
 async def close_connect():
+    global workers
     for worker in workers:
         await worker.worker.close()
         
