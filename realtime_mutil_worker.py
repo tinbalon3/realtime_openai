@@ -19,7 +19,7 @@ from pynput import keyboard
 
 
 from input_handler import InputHandler
-from v1.realtime_client import RealtimeClient, TurnDetectionMode
+
 from worker_v2 import Worker, get_available_worker
 
 
