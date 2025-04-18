@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import os
+import struct
 import sys
 import pyaudio
 
@@ -33,26 +34,74 @@ api_key = os.getenv("OPENAI_API_KEY")
 class TurnDetectionMode(Enum):
     SERVER_VAD = "server_vad"
     MANUAL = "manual"
-
+#  You are TranSlate, a real-time translation tool for English and Vietnamese.
+# - Your only task is to translate text accurately and concisely. 
+# - If the input is in English, translate it to Vietnamese. 
+# - If the input is in Vietnamese, translate it to English. 
+# - Provide only the translation; do not return any additional text or answer questions.
+# - If you don't understand the input, or if the input is unclear, return an empty string.
+# - If the input is unclear, contains noise, or lacks meaning, return an empty string.
+# - Output the translation in plain text format.
 class RealtimeClient:
     """Handles WebSocket communication with OpenAI Realtime API."""
-    
+
+#  Instructions:
+#              -Your are an artificial intelligence agent responsible for translating languages from audio to text.
+#              -Please ust repeat and translate what has been said and translate it.
+#              -The conversation you hear will be in English and Vietnamese.
+#              -When translating, make sure to translate the entire sentence, not just parts of it.
+#              -If you don't understand the input, or if the input is unclear, leave it blank.
+#              -So that all users can understand, respond in both English and Vietnamese.
+#              -Output everything said since the last translation.
+#              Personality:
+#              -None
+#              Format:
+#              \`\`\`
+#              {
+#                 "en": "English translation",
+#                 "vn": "Vietnamese translation"
+#              }
+#              \`\`\`
     def __init__(
         self, 
         api_key: str,
-        model: str = "gpt-4o-realtime-preview-2024-10-01",
+        model: str = "gpt-4o-mini-realtime-preview-2024-12-17",
         voice: str = "alloy",
        
         instructions: str = """
-              You are TranSlate, a real-time translation tool for English and Vietnamese.
-- Your only task is to translate text accurately and concisely. 
-- If the input is in English, translate it to Vietnamese. 
-- If the input is in Vietnamese, translate it to English. 
-- Provide only the translation; do not return any additional text or answer questions.
-- If you don't understand the input, or if the input is unclear, return an empty string.
-- If the input is unclear, contains noise, or lacks meaning, return an empty string.
-- Output the translation in plain text format.
-        """,
+You are a STRICT real-time translator for English and Vietnamese.
+Core Rules:
+1. ONLY translate what you actually hear - NEVER generate content
+2. NEVER complete partial sentences
+3. NEVER make assumptions about unclear audio
+4. If you can't hear clearly = return empty string
+5. If sentence is incomplete = return empty string
+6. NO greetings, NO pleasantries, NO additional responses
+7. ONLY translate complete, clear sentences
+
+Format Requirements:
+- Input must be clear and complete
+- Must hear entire sentence
+- Must understand 100% of content
+- NO partial translations
+- NO guessing missing words
+
+Response Format:
+{
+    "translation": {
+        "text": "", // Empty if not 100% clear
+        "confidence": "high|low", // Only high/low, no medium
+        "complete": false // True only if full sentence heard
+    }
+}
+
+CRITICAL: Return empty response for:
+- Background noise
+- Unclear speech
+- Partial sentences
+- Multiple speakers
+- Uncertain content
+""",
         temperature: float = 0.8,
         turn_detection_mode: TurnDetectionMode = TurnDetectionMode.MANUAL,
         on_text_delta: Optional[Callable[[str], None]] = None,
@@ -131,7 +180,7 @@ class RealtimeClient:
                 },
                 "turn_detection": {
                     "type": "server_vad",
-                    "threshold": 0.5,
+                    "threshold": 0.7,
                     "prefix_padding_ms": 300,
                     "silence_duration_ms": 200
                 },
@@ -151,11 +200,20 @@ class RealtimeClient:
         }
         await self.ws.send(json.dumps(event))
 
+
+    def base64_encode_audio(float32_array):
+        clipped = [max(-1.0, min(1.0, x)) for x in float32_array]
+        pcm16 = b''.join(struct.pack('<h', int(x * 32767)) for x in clipped)
+        encoded = base64.b64encode(pcm16).decode('utf-8')
+        return encoded
+    # def float_to_16bit_pcm(float32_array):
+    #     clipped = [max(-1.0, min(1.0, x)) for x in float32_array]
+    #     pcm16 = b''.join(struct.pack('<h', int(x * 32767)) for x in clipped)
+    #     return pcm16
     async def send_audio(self, audio_chunk: bytes):
-        # print("Sending audio...")
         """Send streaming audio to the API."""
-        # print("Sending audio...")
-        audio_b64 = base64.b64encode(audio_chunk).decode()
+        audio_b64 = base64.b64encode(audio_chunk).decode('utf-8')
+        # audio_b64 = self.base64_encode_audio(audio_chunk)
         await self.ws.send(json.dumps({"type": "input_audio_buffer.append", "audio": audio_b64}))
 
     async def handle_messages(self):
@@ -172,9 +230,7 @@ class RealtimeClient:
                     self._is_responding = True
                    
 
-                # elif event_type == "conversation.item.input_audio_transcription.completed":
-                    # test = event.get("item", "")
-                    # print(f"Item: {event}")
+           
 
                 elif event_type == "response.audio_transcript.done":
                     transcript = event.get("transcript", "")
@@ -200,7 +256,7 @@ class AudioHandler:
         self.format = pyaudio.paInt16
         self.channels = 1
         self.rate = 24000
-        self.chunk = 2048
+        self.chunk = 4096
 
         self.audio = pyaudio.PyAudio()
 
@@ -239,15 +295,12 @@ class AudioHandler:
         global workers
         while self.streaming:
             try:
-              
-
                 # Đọc và gửi audio với timeout
                 data = self.stream.read(self.chunk, exception_on_overflow=False)
-              
+                
                 # await asyncio.wait_for(worker.worker.send_audio(data), timeout=2.0)
                 await worker.worker.send_audio(data)
 
-           
             except Exception as e:
                 logging.error(f"Streaming error: {e}")
                 break
@@ -300,7 +353,7 @@ class AudioHandler:
             audio_segment = AudioSegment(
                 audio_chunk,
                 sample_width=2,
-                frame_rate=2048,
+                frame_rate=4096,
                 channels=1
             )
             
@@ -308,7 +361,7 @@ class AudioHandler:
             audio_data = audio_segment.raw_data
             
             # Play the audio chunk in smaller portions to allow for quicker interruption
-            chunk_size = 2048  # Adjust this value as needed
+            chunk_size = 4096   # Adjust this value as needed
             for i in range(0, len(audio_data), chunk_size):
                 if self.playback_event.is_set():
                     break
@@ -404,7 +457,7 @@ async def init_client(num_workers: int = 1):
 
         asyncio.create_task(audio_handler.start_streaming(worker_used))
         # asyncio.create_task(monitor_workers(workers))  # Thêm giám sát worker
-        asyncio.create_task(process_responses())
+        # asyncio.create_task(process_responses())
 
         while True:
             command, _ = await input_handler.command_queue.get()
@@ -420,20 +473,20 @@ async def init_client(num_workers: int = 1):
         
 
 
-async def process_responses():
-    """Luôn lấy phản hồi từ request_tracker và xử lý theo thứ tự."""
-    global request_tracker
-    while True:
-        request_id, response = await request_tracker.get_next_response()
-        print(f"Processing response {request_id}: {response}")
-        logging.info(f"Processing response {request_id}: {response}")
+# async def process_responses():
+#     """Luôn lấy phản hồi từ request_tracker và xử lý theo thứ tự."""
+#     global request_tracker
+#     while True:
+#         request_id, response = await request_tracker.get_next_response()
+#         print(f"Processing response {request_id}: {response}")
+#         logging.info(f"Processing response {request_id}: {response}")
 
-async def log_worker_status(workers):
-    for worker in workers:
-        logging.info(f"Worker {worker.name}:")
-        logging.info(f"  Available Status: {worker.available_Status}")
-        logging.info(f"  Available Used: {worker.available_Used}")
-        logging.info(f"  Is Responding: {worker.is_responsing}")
+# async def log_worker_status(workers):
+#     for worker in workers:
+#         logging.info(f"Worker {worker.name}:")
+#         logging.info(f"  Available Status: {worker.available_Status}")
+#         logging.info(f"  Available Used: {worker.available_Used}")
+#         logging.info(f"  Is Responding: {worker.is_responsing}")
         
 async def close_connect():
     global workers
